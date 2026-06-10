@@ -1,0 +1,54 @@
+# sql-mcp configuration — MariaDB / MySQL.
+# Copy to sql-mcp.toml and `chmod 600` it: sql-mcp refuses to start if this
+# file is group- or world-readable, because it contains a password.
+
+# "mariadb" and "mysql" share an implementation; pick the matching name.
+driver = "mariadb"
+
+host = "127.0.0.1"
+# Optional; defaults to the backend's well-known port (3306 for mysql/mariadb).
+port = 3306
+
+user = "readonly"
+password = "change-me"
+
+# Optional default schema.
+database = "app"
+
+# Optional. When true, sql-mcp refuses to start unless this account is provably
+# incapable of mutation (verified via SHOW GRANTS). Can also be set with the
+# --read-only flag or SQL_MCP_MODE=ro. Read-only only ever tightens: any of the
+# three turning it on wins.
+# read_only = true
+
+# Optional output caps (0 disables one). Capped result sets carry
+# "truncated": true and capped values end in an in-band truncation marker, so
+# the model knows to narrow with LIMIT/SUBSTRING. They protect server memory
+# and the model's context window. Three caps because each guards a failure
+# mode the others can't see: rows per result set, bytes per single value
+# (one huge TEXT cell fits under any row cap), bytes per whole response.
+# max_rows = 1000              # default 1000
+# max_cell_bytes = 16384       # default 16 KiB
+# max_response_bytes = 262144  # default 256 KiB
+
+# TLS to the database. Off by default (plaintext — fine for localhost/trusted
+# links). When true, the server certificate is verified against the system /
+# built-in roots. Contradictory TLS settings (tls_ca or tls_insecure without
+# tls = true, or both together) are a startup error.
+# tls = true
+#
+# Optional: trust this PEM CA bundle instead of the built-in roots.
+# tls_ca = "/etc/ssl/db-ca.pem"
+#
+# Optional: accept invalid/self-signed certs and skip hostname checks. Dangerous
+# — only for a self-signed server on a trusted link.
+# tls_insecure = false
+
+# Serve MCP over streamable HTTP instead of stdio (for remote agents). HTTP
+# always requires a bearer token — no localhost exemption; local no-auth use
+# is what stdio is for. Generate tokens with: openssl rand -hex 32. Use
+# http_tokens to give each agent its own revocable token. Bind beyond
+# loopback only behind TLS (reverse proxy) or a private network.
+# http_listen = "127.0.0.1:8650"
+# http_token = "change-me-to-a-long-random-token"
+# http_tokens = ["<token-for-agent-a>", "<token-for-agent-b>"]

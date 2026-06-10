@@ -1,0 +1,5 @@
+/target
+
+# Real credentials live here — never commit them.
+/sql-mcp.toml
+*.local.toml

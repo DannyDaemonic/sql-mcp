@@ -1,0 +1,72 @@
+[package]
+name = "sql-mcp"
+version = "0.1.0"
+edition = "2024"
+description = "Deliberately tiny, security-first MCP server exposing one tool: sql_exec(sql). MySQL/MariaDB/PostgreSQL/SQLite."
+license = "MIT OR Apache-2.0"
+
+[profile.release]
+opt-level = "z"   # optimize for size
+lto = true        # cross-crate inlining + dead-code elimination
+codegen-units = 1 # better optimization at the cost of compile time
+panic = "abort"   # drop unwinding tables/landing pads
+strip = true      # strip symbols
+
+[dependencies]
+anyhow = "1.0.102"
+async-trait = "0.1.89"
+# rustls + ring provider: TLS with no OpenSSL/C-TLS, so the static musl build
+# and scratch image stay intact. `default-rustls-ring` also pulls the pure-Rust
+# flate2 backend, derive, and tls12.
+mysql_async = { version = "0.37.0", default-features = false, features = ["default-rustls-ring"] }
+# Bundled = statically compiled amalgamation (musl/scratch image keeps working;
+# the binary stays free of *dynamic* deps). `limits` exposes sqlite3_limit for
+# the read-only ATTACH lockdown. rusqlite is a placeholder backend until the
+# pure-Rust `turso` crate can meet the read-only enforcement bar.
+rusqlite = { version = "0.40.1", features = ["bundled", "limits"] }
+# PostgreSQL over the simple-query protocol (the only one that allows multiple
+# statements per call). `runtime` is the sole default feature; TLS is pluggable.
+tokio-postgres = { version = "0.7.17", default-features = false, features = ["runtime"] }
+# rustls adapter sharing the exact rustls 0.23 + ring stack mysql_async pulls.
+tokio-postgres-rustls = { version = "0.14.0", default-features = false, features = ["ring"] }
+# Direct rustls dep to build the postgres ClientConfig and the tls_insecure
+# verifier (already in the tree via mysql_async; features must unify).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Built-in roots for `tls = true` — same source mysql_async uses.
+webpki-roots = "1.0"
+# StreamExt for tokio-postgres's SimpleQueryStream (already in tree transitively).
+futures-util = { version = "0.3.31", default-features = false }
+rmcp = { version = "1.7.0", features = [
+    "server",
+    "transport-io",
+    "transport-streamable-http-server",
+    "macros",
+] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-std", "net"] }
+toml = "1.1.2"
+# HTTP transport: plain hyper serving rmcp's tower service — no framework.
+http = "1.3"
+http-body-util = "0.1.3"
+bytes = "1.10"
+hyper = { version = "1.8", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1.19", default-features = false, features = ["tokio"] }
+tower-service = "0.3.3"
+# Constant-time token comparison for bearer auth.
+subtle = { version = "2.6", default-features = false }
+
+[dev-dependencies]
+rcgen = "0.14.8"
+# Independent file-format verifier for tests/sqlite.rs (integration tests can't
+# see [dependencies]). Stays when the backend swaps to turso — at which point
+# it becomes the canonical-SQLite compatibility proof.
+rusqlite = { version = "0.40.1", features = ["bundled", "limits"] }
+tempfile = "3.23.0"
+testcontainers = "0.27.3"
+# HTTP client for tests/http.rs (localhost only — no TLS needed).
+futures-util = { version = "0.3.31", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["stream"] }
+# Extra tokio features used only by tests/live.rs; feature unification keeps
+# them out of the plain `cargo build` of the binary.
+tokio = { version = "1.52.3", features = ["io-util", "process", "time"] }

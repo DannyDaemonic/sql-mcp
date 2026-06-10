@@ -1,0 +1,44 @@
+# sql-mcp configuration — SQLite.
+# Copy to sql-mcp.toml and `chmod 600` it: sql-mcp refuses to start if this
+# file is group- or world-readable. (No password here, but the permission rule
+# applies to every config.)
+#
+# The SQLite engine is compiled into the sql-mcp binary — no server and no
+# sqlite install needed. The network/TLS keys from the MariaDB/MySQL example
+# don't apply to this driver and are rejected as unknown.
+
+driver = "sqlite"
+
+# Database file path, or ":memory:" for a throwaway in-memory database.
+path = "./app.db"
+# path = ":memory:"
+
+# Opt-in: create the file if it doesn't exist. Without this, a missing file is
+# a startup error — a typo'd path can never silently become an empty database.
+# Not needed for ":memory:".
+# create = true
+
+# Optional. When true, the file is opened read-only and ATTACH is disabled —
+# enforced below the SQL layer, so no statement can write or open a writable
+# second file. Can also be set with --read-only or SQL_MCP_MODE=ro; read-only
+# only ever tightens. (Contradicts create = true and ":memory:".)
+# read_only = true
+
+# Optional output caps (0 disables one). Capped result sets carry
+# "truncated": true and capped values end in an in-band truncation marker, so
+# the model knows to narrow with LIMIT/SUBSTRING. They protect server memory
+# and the model's context window. Three caps because each guards a failure
+# mode the others can't see: rows per result set, bytes per single value
+# (one huge TEXT cell fits under any row cap), bytes per whole response.
+# max_rows = 1000              # default 1000
+# max_cell_bytes = 16384       # default 16 KiB
+# max_response_bytes = 262144  # default 256 KiB
+
+# Serve MCP over streamable HTTP instead of stdio (for remote agents). HTTP
+# always requires a bearer token — no localhost exemption; local no-auth use
+# is what stdio is for. Generate tokens with: openssl rand -hex 32. Use
+# http_tokens to give each agent its own revocable token. Bind beyond
+# loopback only behind TLS (reverse proxy) or a private network.
+# http_listen = "127.0.0.1:8650"
+# http_token = "change-me-to-a-long-random-token"
+# http_tokens = ["<token-for-agent-a>", "<token-for-agent-b>"]

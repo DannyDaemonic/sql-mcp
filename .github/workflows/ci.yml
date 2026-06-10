@@ -1,0 +1,36 @@
+name: ci
+
+# Code hygiene, decoupled from publishing: a red X here flags the commit but
+# never blocks an image release (docker-publish.yml gates only on tests).
+# Pull requests also run the full test suite, since the publish workflow
+# doesn't trigger for them.
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests (pull requests only — pushes run them in docker-publish)
+        if: github.event_name == 'pull_request'
+        run: cargo test
