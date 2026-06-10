@@ -1,0 +1,5 @@
+/target
+
+# Real credentials
+/sql-mcp.toml
+*.local.toml

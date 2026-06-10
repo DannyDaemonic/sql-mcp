@@ -1,0 +1,41 @@
+[package]
+name = "sql-mcp"
+version = "0.1.0"
+edition = "2024"
+description = "Deliberately tiny, security-first MCP server exposing one tool: sql_exec(sql). MySQL/MariaDB/PostgreSQL/SQLite."
+license = "MIT OR Apache-2.0"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[dependencies]
+anyhow = "1.0.102"
+async-trait = "0.1.89"
+mysql_async = { version = "0.37.0", default-features = false, features = ["default-rustls-ring"] }
+rusqlite = { version = "0.40.1", features = ["bundled", "limits"] }
+tokio-postgres = { version = "0.7.17", default-features = false, features = ["runtime"] }
+tokio-postgres-rustls = { version = "0.14.0", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1.0"
+futures-util = { version = "0.3.31", default-features = false }
+rmcp = { version = "1.7.0", features = [
+    "server",
+    "transport-io",
+    "transport-streamable-http-server",
+    "macros",
+] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-std", "net"] }
+toml = "1.1.2"
+http = "1.3"
+http-body-util = "0.1.3"
+bytes = "1.10"
+hyper = { version = "1.8", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1.19", default-features = false, features = ["tokio"] }
+tower-service = "0.3.3"
+subtle = { version = "2.6", default-features = false }
