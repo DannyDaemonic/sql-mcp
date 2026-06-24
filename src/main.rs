@@ -16,11 +16,7 @@ use rmcp::{
 };
 use serde::Deserialize;
 
-use crate::config::BackendConfig;
-use crate::driver::mysql::MySqlDriver;
-use crate::driver::postgres::PostgresDriver;
-use crate::driver::sqlite::SqliteDriver;
-use crate::driver::{Driver, Limits};
+use crate::driver::{ConnectionPool, Driver, DriverFactory, Limits};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SqlExecArgs {
@@ -33,6 +29,38 @@ pub struct SqlServer {
     read_only: bool,
     limits: Limits,
     tool_router: ToolRouter<Self>,
+}
+
+#[derive(Clone)]
+pub struct SqlServerFactory {
+    driver: Arc<DriverFactory>,
+    pool: Arc<ConnectionPool>,
+    read_only: bool,
+    limits: Limits,
+}
+
+impl SqlServerFactory {
+    fn new(
+        driver: Arc<DriverFactory>,
+        pool: Arc<ConnectionPool>,
+        read_only: bool,
+        limits: Limits,
+    ) -> Self {
+        Self {
+            driver,
+            pool,
+            read_only,
+            limits,
+        }
+    }
+
+    fn new_session(&self) -> SqlServer {
+        SqlServer::new(
+            self.driver.new_http_session(Arc::clone(&self.pool)),
+            self.read_only,
+            self.limits,
+        )
+    }
 }
 
 #[tool_router]
@@ -152,16 +180,21 @@ impl ServerHandler for SqlServer {
 async fn main() -> Result<()> {
     let config = config::load()?;
 
-    let name = config.backend.name();
-    let driver: Arc<dyn Driver> = match &config.backend {
-        BackendConfig::Mysql(net) | BackendConfig::Mariadb(net) => {
-            Arc::new(MySqlDriver::connect(net, name).await?)
-        }
-        BackendConfig::Postgres(net) => Arc::new(PostgresDriver::connect(net).await?),
-        BackendConfig::Sqlite(sqlite) => Arc::new(SqliteDriver::connect(sqlite, config.read_only)?),
+    let http = config.http()?;
+    let database = config.database;
+    let read_only = database.read_only;
+    let limits = Limits {
+        max_rows: database.max_rows,
+        max_cell_bytes: database.max_cell_bytes,
+        max_response_bytes: database.max_response_bytes,
     };
+    let factory = Arc::new(DriverFactory::new(database.backend, read_only));
+    let driver = factory
+        .connect()
+        .await
+        .context("connecting to validate configuration")?;
 
-    if config.read_only {
+    if read_only {
         if driver.enforces_read_only_at_connection() {
             eprintln!(
                 "[sql-mcp] read-only mode: {} enforces read-only at the connection.",
@@ -179,11 +212,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    let limits = Limits {
-        max_rows: config.max_rows,
-        max_cell_bytes: config.max_cell_bytes,
-        max_response_bytes: config.max_response_bytes,
-    };
     let cap = |n: u64| {
         if n == 0 {
             "off".to_string()
@@ -191,21 +219,27 @@ async fn main() -> Result<()> {
             n.to_string()
         }
     };
-    let http = config.http()?;
     eprintln!(
         "[sql-mcp] serving sql_exec for {} over {}{} (caps: {} rows/set, {} bytes/value, {} bytes/response).",
-        driver.name(),
+        factory.name(),
         if http.is_some() { "http" } else { "stdio" },
-        if config.read_only { " (read-only)" } else { "" },
+        if read_only { " (read-only)" } else { "" },
         cap(limits.max_rows),
         cap(limits.max_cell_bytes),
         cap(limits.max_response_bytes),
     );
 
-    let server = SqlServer::new(driver, config.read_only, limits);
     match http {
-        Some(http) => http::serve(server, http).await?,
+        Some(http) => {
+            let pool = ConnectionPool::new(http.max_sessions, http.eviction_grace);
+            let keep = factory.requires_lifetime_keeper();
+            let servers = SqlServerFactory::new(factory, pool, read_only, limits);
+
+            let _keeper = keep.then_some(driver);
+            http::serve(servers, http).await?
+        }
         None => {
+            let server = SqlServer::new(driver, read_only, limits);
             let service = server
                 .serve(stdio())
                 .await

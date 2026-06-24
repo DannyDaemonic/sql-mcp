@@ -13,7 +13,9 @@ use tokio_postgres::{Client, SimpleQueryMessage};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::config::NetConfig;
-use crate::driver::{Driver, Limits, QueryOutput, ResultSet, cap_cell, estimate_bytes};
+use crate::driver::{
+    BackendProfile, Driver, Limits, QueryOutput, ResultSet, cap_cell, estimate_bytes,
+};
 
 const DEFAULT_PORT: u16 = 5432;
 
@@ -27,10 +29,16 @@ pub struct PostgresDriver {
 
     tls: Option<rustls::ClientConfig>,
     client: Mutex<Option<Client>>,
+    profile: &'static BackendProfile,
+    read_only: bool,
 }
 
 impl PostgresDriver {
-    pub async fn connect(config: &NetConfig) -> Result<Self> {
+    pub async fn connect(
+        config: &NetConfig,
+        profile: &'static BackendProfile,
+        read_only: bool,
+    ) -> Result<Self> {
         let mut pg_config = tokio_postgres::Config::new();
         pg_config
             .host(&config.host)
@@ -58,6 +66,8 @@ impl PostgresDriver {
             pg_config,
             tls,
             client: Mutex::new(Some(client)),
+            profile,
+            read_only,
         })
     }
 }
@@ -97,20 +107,15 @@ async fn establish(
 #[async_trait::async_trait]
 impl Driver for PostgresDriver {
     fn name(&self) -> &'static str {
-        "postgres"
+        self.profile.name()
     }
 
     fn introspection_hint(&self) -> &'static str {
-        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public', \
-         and pg_catalog views such as pg_tables and pg_indexes"
+        self.profile.introspection_hint()
     }
 
     fn exec_notes(&self) -> &'static str {
-        " Every value is returned as text (PostgreSQL renders it; bytea arrives as \\x-prefixed \
-         hex); cast or parse as needed; last_insert_id is never set, use INSERT ... RETURNING. \
-         All statements of one call run in a single transaction: if any statement fails, the \
-         whole call's effects are rolled back (explicit BEGIN/COMMIT overrides this). \
-         COPY FROM STDIN and COPY TO STDOUT are not supported; use INSERT and SELECT."
+        self.profile.exec_notes()
     }
 
     async fn assert_read_only(&self) -> Result<()> {
@@ -177,10 +182,7 @@ impl Driver for PostgresDriver {
 
             Some(client) if client.is_closed() => {
                 *guard = None;
-                bail!(
-                    "database connection lost; it will be re-established on the next \
-                     call with fresh session state (SET/temp tables are gone)"
-                );
+                bail!("{}", self.profile.connection_lost(self.read_only));
             }
             Some(_) => {}
         }
@@ -190,20 +192,18 @@ impl Driver for PostgresDriver {
             Ok(output) => Ok(output),
             Err(e) if e.is_closed() => {
                 *guard = None;
-                Err(anyhow::Error::new(e).context(
-                    "database connection lost; it will be re-established on the next \
-                     call with fresh session state (SET/temp tables are gone)",
-                ))
+                Err(anyhow::Error::new(e).context(self.profile.connection_lost(self.read_only)))
             }
 
             Err(e) if e.as_db_error().is_none() => {
                 *guard = None;
-                Err(anyhow::Error::new(e).context(
+                Err(anyhow::Error::new(e).context(format!(
                     "the call failed at the protocol level (COPY FROM STDIN / TO STDOUT \
                      is not supported over this transport) and the connection was \
                      discarded; it will be re-established on the next call with fresh \
-                     session state (SET/temp tables are gone)",
-                ))
+                     session state; {}",
+                    self.profile.lost_state(self.read_only)
+                )))
             }
 
             Err(e) => Err(anyhow::anyhow!(error_text(&e))),

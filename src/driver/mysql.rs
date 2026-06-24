@@ -6,7 +6,8 @@ use tokio::sync::Mutex;
 
 use crate::config::NetConfig;
 use crate::driver::{
-    Driver, Limits, QueryOutput, ResultSet, cap_cell, estimate_bytes, float_to_json, to_hex,
+    BackendProfile, Driver, Limits, QueryOutput, ResultSet, cap_cell, estimate_bytes,
+    float_to_json, to_hex,
 };
 
 const READ_ONLY_PRIVILEGES: &[&str] = &["SELECT", "SHOW VIEW", "USAGE"];
@@ -18,11 +19,16 @@ const DEFAULT_PORT: u16 = 3306;
 pub struct MySqlDriver {
     opts: Opts,
     conn: Mutex<Option<Conn>>,
-    name: &'static str,
+    profile: &'static BackendProfile,
+    read_only: bool,
 }
 
 impl MySqlDriver {
-    pub async fn connect(config: &NetConfig, name: &'static str) -> Result<Self> {
+    pub async fn connect(
+        config: &NetConfig,
+        profile: &'static BackendProfile,
+        read_only: bool,
+    ) -> Result<Self> {
         let mut opts = OptsBuilder::default()
             .ip_or_hostname(config.host.clone())
             .tcp_port(config.port.unwrap_or(DEFAULT_PORT))
@@ -51,7 +57,8 @@ impl MySqlDriver {
         Ok(Self {
             opts,
             conn: Mutex::new(Some(conn)),
-            name,
+            profile,
+            read_only,
         })
     }
 }
@@ -59,15 +66,15 @@ impl MySqlDriver {
 #[async_trait::async_trait]
 impl Driver for MySqlDriver {
     fn name(&self) -> &'static str {
-        self.name
+        self.profile.name()
     }
 
     fn introspection_hint(&self) -> &'static str {
-        "SHOW TABLES, DESCRIBE <table>, SHOW CREATE TABLE <table>, and information_schema"
+        self.profile.introspection_hint()
     }
 
     fn exec_notes(&self) -> &'static str {
-        " Binary values use 0x hex."
+        self.profile.exec_notes()
     }
 
     async fn assert_read_only(&self) -> Result<()> {
@@ -111,10 +118,7 @@ impl Driver for MySqlDriver {
             Ok(output) => Ok(output),
             Err(e) if e.is_fatal() => {
                 *guard = None;
-                Err(anyhow::Error::new(e).context(
-                    "database connection lost; it will be re-established on the next \
-                     call with fresh session state (USE/SET/temp tables are gone)",
-                ))
+                Err(anyhow::Error::new(e).context(self.profile.connection_lost(self.read_only)))
             }
             Err(e) => Err(e.into()),
         }

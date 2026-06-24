@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
@@ -8,16 +9,25 @@ use rusqlite::{Batch, Connection, OpenFlags};
 
 use crate::config::SqliteConfig;
 use crate::driver::{
-    Driver, Limits, QueryOutput, ResultSet, cap_cell, estimate_bytes, float_to_json, to_hex,
+    BackendProfile, Driver, Limits, QueryOutput, ResultSet, cap_cell, estimate_bytes,
+    float_to_json, to_hex,
 };
 
 pub struct SqliteDriver {
     conn: Arc<Mutex<Connection>>,
+    profile: &'static BackendProfile,
 }
 
 impl SqliteDriver {
-    pub fn connect(config: &SqliteConfig, read_only: bool) -> Result<Self> {
-        let flags = if read_only {
+    pub fn connect(
+        config: &SqliteConfig,
+        profile: &'static BackendProfile,
+        read_only: bool,
+        memory_uri: Option<&str>,
+    ) -> Result<Self> {
+        let shared_memory = if config.is_memory() { memory_uri } else { None };
+
+        let mut flags = if read_only {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX
         } else if config.is_memory() || config.create {
             OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -26,6 +36,9 @@ impl SqliteDriver {
         } else {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX
         };
+        if shared_memory.is_some() {
+            flags |= OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_SHARED_CACHE;
+        }
 
         if !config.is_memory() && !config.create && !config.path.exists() {
             if read_only {
@@ -38,8 +51,15 @@ impl SqliteDriver {
             );
         }
 
-        let conn = Connection::open_with_flags(&config.path, flags)
-            .with_context(|| format!("failed to open database {}", config.path.display()))?;
+        let (target, target_name): (&Path, String) = match shared_memory {
+            Some(uri) => (Path::new(uri), format!("shared in-memory database {uri:?}")),
+            None => (
+                config.path.as_ref(),
+                format!("database {}", config.path.display()),
+            ),
+        };
+        let conn = Connection::open_with_flags(target, flags)
+            .with_context(|| format!("failed to open {target_name}"))?;
 
         if read_only {
             conn.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)
@@ -52,10 +72,11 @@ impl SqliteDriver {
         }
 
         conn.query_row("SELECT 1", [], |_| Ok(()))
-            .with_context(|| format!("database {} failed a probe query", config.path.display()))?;
+            .with_context(|| format!("{target_name} failed a probe query"))?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            profile,
         })
     }
 }
@@ -63,16 +84,15 @@ impl SqliteDriver {
 #[async_trait::async_trait]
 impl Driver for SqliteDriver {
     fn name(&self) -> &'static str {
-        "sqlite"
+        self.profile.name()
     }
 
     fn introspection_hint(&self) -> &'static str {
-        "SELECT name, sql FROM sqlite_master, PRAGMA table_info(<table>), \
-         and PRAGMA database_list"
+        self.profile.introspection_hint()
     }
 
     fn exec_notes(&self) -> &'static str {
-        " Binary values use 0x hex."
+        self.profile.exec_notes()
     }
 
     fn enforces_read_only_at_connection(&self) -> bool {
@@ -215,11 +235,16 @@ fn value_ref_to_json(value: ValueRef<'_>) -> serde_json::Value {
 mod tests {
     use super::*;
     use crate::config::SqliteConfig;
-    use crate::driver::Limits;
+    use crate::driver::{Limits, SQLITE_PROFILE};
 
     fn memory_driver() -> SqliteDriver {
         let config: SqliteConfig = toml::from_str("path = \":memory:\"").unwrap();
-        SqliteDriver::connect(&config, false).unwrap()
+        SqliteDriver::connect(&config, &SQLITE_PROFILE, false, None).unwrap()
+    }
+
+    fn shared_memory_driver(uri: &str) -> SqliteDriver {
+        let config: SqliteConfig = toml::from_str("path = \":memory:\"").unwrap();
+        SqliteDriver::connect(&config, &SQLITE_PROFILE, false, Some(uri)).unwrap()
     }
 
     const NO_LIMITS: Limits = Limits {
@@ -227,6 +252,54 @@ mod tests {
         max_cell_bytes: 0,
         max_response_bytes: 0,
     };
+
+    #[tokio::test]
+    async fn shared_cache_memory_is_visible_across_connections() {
+        let uri = "file:sqlmcp-test-share?mode=memory&cache=shared";
+        let _keeper = shared_memory_driver(uri);
+        let a = shared_memory_driver(uri);
+        a.exec(
+            "CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('hi')",
+            NO_LIMITS,
+        )
+        .await
+        .unwrap();
+        let b = shared_memory_driver(uri);
+        let out = b.exec("SELECT v FROM t", NO_LIMITS).await.unwrap();
+        assert_eq!(out.result_sets[0].rows[0][0], serde_json::json!("hi"));
+    }
+
+    #[tokio::test]
+    async fn keeper_keeps_memory_db_alive_across_session_churn() {
+        let uri = "file:sqlmcp-test-keeper?mode=memory&cache=shared";
+        let _keeper = shared_memory_driver(uri);
+        {
+            let session = shared_memory_driver(uri);
+            session
+                .exec(
+                    "CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('x')",
+                    NO_LIMITS,
+                )
+                .await
+                .unwrap();
+        }
+        let next = shared_memory_driver(uri);
+        let out = next.exec("SELECT v FROM t", NO_LIMITS).await.unwrap();
+        assert_eq!(out.result_sets[0].rows[0][0], serde_json::json!("x"));
+    }
+
+    #[tokio::test]
+    async fn without_keeper_memory_db_dies_with_last_connection() {
+        let uri = "file:sqlmcp-test-nokeeper?mode=memory&cache=shared";
+        {
+            let only = shared_memory_driver(uri);
+            only.exec("CREATE TABLE t (v TEXT)", NO_LIMITS)
+                .await
+                .unwrap();
+        }
+        let fresh = shared_memory_driver(uri);
+        assert!(fresh.exec("SELECT v FROM t", NO_LIMITS).await.is_err());
+    }
 
     #[tokio::test]
     async fn ddl_reports_zero_rows_affected_and_insert_reports_rowid() {

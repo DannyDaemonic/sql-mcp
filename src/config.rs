@@ -1,10 +1,23 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+fn secs_or_none(secs: u64) -> Option<Duration> {
+    (secs != 0).then(|| Duration::from_secs(secs))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
+    pub database: DatabaseConfig,
+
+    #[serde(default)]
+    http: Option<HttpInput>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DatabaseConfig {
     #[serde(flatten)]
     pub backend: BackendConfig,
 
@@ -19,53 +32,58 @@ pub struct Config {
 
     #[serde(default = "default_max_response_bytes")]
     pub max_response_bytes: u64,
+}
 
+#[derive(Debug, Deserialize)]
+struct HttpInput {
+    listen: String,
     #[serde(default)]
-    http_listen: Option<String>,
-
+    token: Option<String>,
     #[serde(default)]
-    http_token: Option<String>,
-
-    #[serde(default)]
-    http_tokens: Option<Vec<String>>,
+    tokens: Option<Vec<String>>,
+    #[serde(default = "default_max_sessions")]
+    max_sessions: usize,
+    #[serde(default = "default_session_idle_timeout")]
+    session_idle_timeout: u64,
+    #[serde(default = "default_eviction_grace")]
+    eviction_grace: u64,
 }
 
 #[derive(Debug, Clone)]
 pub struct HttpConfig {
     pub listen: std::net::SocketAddr,
     pub tokens: Vec<String>,
+    pub max_sessions: usize,
+    pub session_idle_timeout: Option<Duration>,
+    pub eviction_grace: Option<Duration>,
 }
 
 impl Config {
     pub fn http(&self) -> Result<Option<HttpConfig>> {
-        let mut tokens: Vec<String> = match (&self.http_token, &self.http_tokens) {
+        let Some(http) = &self.http else {
+            return Ok(None);
+        };
+        let mut tokens: Vec<String> = match (&http.token, &http.tokens) {
             (Some(_), Some(_)) => {
-                bail!("http_token and http_tokens are both set; pick one")
+                bail!("http.token and http.tokens are both set; pick one")
             }
             (Some(token), None) => vec![token.clone()],
             (None, Some(list)) => list.clone(),
             (None, None) => Vec::new(),
         };
 
-        let Some(listen) = &self.http_listen else {
-            if !tokens.is_empty() {
-                bail!(
-                    "http_token(s) is set but http_listen is not; add \
-                     http_listen = \"127.0.0.1:8650\" (or remove the token)"
-                );
-            }
-            return Ok(None);
-        };
-
-        let listen: std::net::SocketAddr = listen.parse().with_context(|| {
-            format!("http_listen {listen:?} is not an IP:port address (e.g. \"127.0.0.1:8650\")")
+        let listen: std::net::SocketAddr = http.listen.parse().with_context(|| {
+            format!(
+                "http.listen {:?} is not an IP:port address (e.g. \"127.0.0.1:8650\")",
+                http.listen
+            )
         })?;
 
         if tokens.is_empty() {
             bail!(
-                "http_listen is set but no bearer token is configured; HTTP always \
+                "[http] is configured but no bearer token is configured; HTTP always \
                  requires auth (stdio is the no-auth local transport). Generate one: \
-                 openssl rand -hex 32, then set http_token = \"<value>\""
+                 openssl rand -hex 32, then set token = \"<value>\""
             );
         }
         for token in &tokens {
@@ -80,14 +98,30 @@ impl Config {
         tokens.sort();
         tokens.dedup();
         if tokens.len() != before {
-            bail!("http_tokens contains duplicates; each agent should get its own token");
+            bail!("http.tokens contains duplicates; each agent should get its own token");
+        }
+        if http.max_sessions == 0 {
+            bail!("http.max_sessions must be at least 1");
+        }
+        if http.session_idle_timeout == 0 && http.eviction_grace == 0 {
+            bail!(
+                "http.session_idle_timeout and http.eviction_grace cannot both be 0: idle sessions \
+                 would never be reclaimed, locking out new sessions once max_sessions is full; set \
+                 at least one nonzero"
+            );
         }
 
-        Ok(Some(HttpConfig { listen, tokens }))
+        Ok(Some(HttpConfig {
+            listen,
+            tokens,
+            max_sessions: http.max_sessions,
+            session_idle_timeout: secs_or_none(http.session_idle_timeout),
+            eviction_grace: secs_or_none(http.eviction_grace),
+        }))
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "driver", rename_all = "lowercase")]
 pub enum BackendConfig {
     Mysql(NetConfig),
@@ -96,18 +130,7 @@ pub enum BackendConfig {
     Sqlite(SqliteConfig),
 }
 
-impl BackendConfig {
-    pub fn name(&self) -> &'static str {
-        match self {
-            BackendConfig::Mysql(_) => "mysql",
-            BackendConfig::Mariadb(_) => "mariadb",
-            BackendConfig::Postgres(_) => "postgres",
-            BackendConfig::Sqlite(_) => "sqlite",
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SqliteConfig {
     pub path: PathBuf,
 
@@ -129,8 +152,9 @@ impl SqliteConfig {
         }
         if self.is_memory() && read_only {
             bail!(
-                "path = \":memory:\" contradicts read-only mode: a fresh in-memory \
-                 database is empty, so a read-only connection to it can answer nothing"
+                "path = \":memory:\" contradicts read-only mode: this database is created \
+                 empty when the process starts and is gone when it stops, so there is never \
+                 any pre-existing data for a read-only connection to serve"
             );
         }
         if self.is_memory() && self.create {
@@ -140,7 +164,7 @@ impl SqliteConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct NetConfig {
     pub host: String,
 
@@ -196,6 +220,18 @@ fn default_max_response_bytes() -> u64 {
     256 * 1024
 }
 
+fn default_max_sessions() -> usize {
+    16
+}
+
+fn default_session_idle_timeout() -> u64 {
+    28_800
+}
+
+fn default_eviction_grace() -> u64 {
+    300
+}
+
 pub fn load() -> Result<Config> {
     let mut path: Option<PathBuf> = std::env::var_os("SQL_MCP_CONFIG").map(PathBuf::from);
     let mut force_read_only = false;
@@ -242,13 +278,13 @@ pub fn load() -> Result<Config> {
         .try_into()
         .with_context(|| format!("parsing config file {}", path.display()))?;
 
-    config.read_only = config.read_only || force_read_only;
+    config.database.read_only = config.database.read_only || force_read_only;
 
-    match &config.backend {
+    match &config.database.backend {
         BackendConfig::Mysql(net) | BackendConfig::Mariadb(net) | BackendConfig::Postgres(net) => {
             net.validate()?
         }
-        BackendConfig::Sqlite(sqlite) => sqlite.validate(config.read_only)?,
+        BackendConfig::Sqlite(sqlite) => sqlite.validate(config.database.read_only)?,
     }
 
     config.http()?;
@@ -256,15 +292,23 @@ pub fn load() -> Result<Config> {
     Ok(config)
 }
 
-const COMMON_KEYS: &[&str] = &[
+const ROOT_KEYS: &[&str] = &["database", "http"];
+
+const DATABASE_KEYS: &[&str] = &[
     "driver",
     "read_only",
     "max_rows",
     "max_cell_bytes",
     "max_response_bytes",
-    "http_listen",
-    "http_token",
-    "http_tokens",
+];
+
+const HTTP_KEYS: &[&str] = &[
+    "listen",
+    "token",
+    "tokens",
+    "max_sessions",
+    "session_idle_timeout",
+    "eviction_grace",
 ];
 
 const NET_KEYS: &[&str] = &[
@@ -280,10 +324,52 @@ const NET_KEYS: &[&str] = &[
 
 const SQLITE_KEYS: &[&str] = &["path", "create"];
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ConfigSection {
+    Root,
+    Database,
+    Http,
+}
+
+impl ConfigSection {
+    fn name(self) -> &'static str {
+        match self {
+            ConfigSection::Root => "config",
+            ConfigSection::Database => "database",
+            ConfigSection::Http => "http",
+        }
+    }
+
+    fn destination(self, key: &str) -> String {
+        match self {
+            ConfigSection::Root => format!("the top level as [{key}]"),
+            ConfigSection::Database => "[database]".to_string(),
+            ConfigSection::Http => "[http]".to_string(),
+        }
+    }
+}
+
+const SECTIONS: &[(ConfigSection, &[&[&str]])] = &[
+    (
+        ConfigSection::Database,
+        &[DATABASE_KEYS, NET_KEYS, SQLITE_KEYS],
+    ),
+    (ConfigSection::Http, &[HTTP_KEYS]),
+    (ConfigSection::Root, &[ROOT_KEYS]),
+];
+
 fn reject_unknown_keys(table: &toml::Table) -> Result<()> {
-    let driver = table.get("driver").and_then(|v| v.as_str()).context(
-        "config is missing the required `driver` key (\"mysql\", \"mariadb\", \"postgres\", \
-         or \"sqlite\")",
+    reject_keys(ConfigSection::Root, table, ROOT_KEYS)?;
+    let Some(database_value) = table.get("database") else {
+        bail!("config is missing the required [database] table");
+    };
+    let database = database_value.as_table().context(
+        "top-level `database` must be a [database] table; if this is a database name, put \
+         `database = ...` under [database]",
+    )?;
+    let driver = database.get("driver").and_then(|v| v.as_str()).context(
+        "[database] is missing the required `driver` key (\"mysql\", \"mariadb\", \
+         \"postgres\", or \"sqlite\")",
     )?;
     let backend_keys: &[&str] = match driver {
         "mysql" | "mariadb" | "postgres" => NET_KEYS,
@@ -293,24 +379,59 @@ fn reject_unknown_keys(table: &toml::Table) -> Result<()> {
         }
     };
 
+    let allowed: Vec<&str> = DATABASE_KEYS.iter().chain(backend_keys).copied().collect();
+    reject_keys(ConfigSection::Database, database, &allowed)?;
+    if let Some(http) = table.get("http") {
+        let http = http
+            .as_table()
+            .context("http must be a TOML table (`[http]`)")?;
+        reject_keys(ConfigSection::Http, http, HTTP_KEYS)?;
+    }
+    Ok(())
+}
+
+fn reject_keys(section: ConfigSection, table: &toml::Table, known: &[&str]) -> Result<()> {
     for key in table.keys() {
         let key = key.as_str();
-        if COMMON_KEYS.contains(&key) || backend_keys.contains(&key) {
+        if known.contains(&key) {
             continue;
         }
-        let suggestion = COMMON_KEYS
+        if let Some(message) = misplaced_key_message(section, key) {
+            bail!("{message}");
+        }
+        let suggestion = known
             .iter()
-            .chain(backend_keys)
             .min_by_key(|known| edit_distance(key, known))
             .filter(|known| edit_distance(key, known) <= 2)
             .map(|known| format!(" (did you mean {known:?}?)"))
             .unwrap_or_default();
         bail!(
-            "unknown config key {key:?}{suggestion}; unknown keys are rejected so a \
-             typo'd setting can never be silently ignored"
+            "unknown {} key {key:?}{suggestion}; unknown keys are rejected so a typo'd \
+             setting can never be silently ignored",
+            section.name()
         );
     }
     Ok(())
+}
+
+fn misplaced_key_message(section: ConfigSection, key: &str) -> Option<String> {
+    let belongs_here = |s: ConfigSection| {
+        SECTIONS
+            .iter()
+            .find(|(candidate, _)| *candidate == s)
+            .is_some_and(|(_, groups)| groups.iter().any(|group| group.contains(&key)))
+    };
+    if belongs_here(section) {
+        return None;
+    }
+
+    let (home, _) = SECTIONS
+        .iter()
+        .find(|(s, groups)| *s != section && groups.iter().any(|group| group.contains(&key)))?;
+    Some(format!(
+        "`{key}` belongs under {}; move it there",
+        home.destination(key)
+    ))
 }
 
 fn edit_distance(a: &str, b: &str) -> usize {
@@ -367,7 +488,8 @@ fn print_help() {
         "                          incapable of mutation. Also via SQL_MCP_MODE=ro.\n",
         "    -h, --help            Show this help.\n",
         "\n",
-        "The config file holds driver (mysql/mariadb/postgres/sqlite) plus its settings:\n",
+        "The config file has a required [database] table holding driver\n",
+        "(mysql/mariadb/postgres/sqlite) plus its settings:\n",
         "host/port/user/password/database for network backends, or path (and optional\n",
         "create = true, or path = \":memory:\") for sqlite. Optional read_only = true and\n",
         "output caps (max_rows, max_cell_bytes, max_response_bytes; 0 disables). Unknown\n",
@@ -380,9 +502,10 @@ mod tests {
     use super::{BackendConfig, Config};
 
     #[test]
-    fn parses_flat_toml_into_tagged_backend() {
+    fn parses_database_and_http_tables() {
         let config: Config = toml::from_str(
             r#"
+            [database]
             driver = "mariadb"
             host = "127.0.0.1"
             port = 3307
@@ -392,47 +515,60 @@ mod tests {
             read_only = true
             max_rows = 50
             tls = true
+
+            [http]
+            listen = "127.0.0.1:8650"
+            token = "0123456789abcdef0123456789abcdef"
             "#,
         )
         .unwrap();
-        assert!(config.read_only);
-        assert_eq!(config.max_rows, 50);
-        let BackendConfig::Mariadb(net) = &config.backend else {
+        assert!(config.database.read_only);
+        assert_eq!(config.database.max_rows, 50);
+        let BackendConfig::Mariadb(net) = &config.database.backend else {
             panic!("wrong backend");
         };
         assert_eq!(net.port, Some(3307));
         assert!(net.tls);
         assert_eq!(net.database.as_deref(), Some("app"));
+        let http = config.http().unwrap().unwrap();
+        assert_eq!(http.listen.port(), 8650);
+        assert_eq!(http.max_sessions, 16);
+        assert_eq!(http.session_idle_timeout.unwrap().as_secs(), 28_800);
+        assert_eq!(http.eviction_grace.unwrap().as_secs(), 300);
     }
 
     #[test]
     fn defaults_apply() {
         let config: Config =
-            toml::from_str("driver = \"mysql\"\nhost = \"h\"\nuser = \"u\"").unwrap();
-        assert!(!config.read_only);
-        assert_eq!(config.max_rows, 1000);
-        assert_eq!(config.max_cell_bytes, 16 * 1024);
-        assert_eq!(config.max_response_bytes, 256 * 1024);
-        let BackendConfig::Mysql(net) = &config.backend else {
+            toml::from_str("[database]\ndriver = \"mysql\"\nhost = \"h\"\nuser = \"u\"").unwrap();
+        assert!(!config.database.read_only);
+        assert_eq!(config.database.max_rows, 1000);
+        assert_eq!(config.database.max_cell_bytes, 16 * 1024);
+        assert_eq!(config.database.max_response_bytes, 256 * 1024);
+        let BackendConfig::Mysql(net) = &config.database.backend else {
             panic!("wrong backend");
         };
         assert_eq!(net.port, None);
         assert!(!net.tls);
+        assert!(config.http().unwrap().is_none());
     }
 
     #[test]
     fn parses_sqlite_config() {
-        let config: Config =
-            toml::from_str("driver = \"sqlite\"\npath = \"/tmp/app.db\"\ncreate = true").unwrap();
-        let BackendConfig::Sqlite(sqlite) = &config.backend else {
+        let config: Config = toml::from_str(
+            "[database]\ndriver = \"sqlite\"\npath = \"/tmp/app.db\"\ncreate = true",
+        )
+        .unwrap();
+        let BackendConfig::Sqlite(sqlite) = &config.database.backend else {
             panic!("wrong backend");
         };
         assert_eq!(sqlite.path.to_str(), Some("/tmp/app.db"));
         assert!(sqlite.create);
         assert!(!sqlite.is_memory());
 
-        let config: Config = toml::from_str("driver = \"sqlite\"\npath = \":memory:\"").unwrap();
-        let BackendConfig::Sqlite(sqlite) = &config.backend else {
+        let config: Config =
+            toml::from_str("[database]\ndriver = \"sqlite\"\npath = \":memory:\"").unwrap();
+        let BackendConfig::Sqlite(sqlite) = &config.database.backend else {
             panic!("wrong backend");
         };
         assert!(!sqlite.create);
@@ -442,23 +578,24 @@ mod tests {
     #[test]
     fn parses_postgres_config() {
         let config: Config = toml::from_str(
-            "driver = \"postgres\"\nhost = \"db.example\"\nuser = \"ro\"\ndatabase = \"app\"",
+            "[database]\ndriver = \"postgres\"\nhost = \"db.example\"\nuser = \"ro\"\ndatabase = \"app\"",
         )
         .unwrap();
-        let BackendConfig::Postgres(net) = &config.backend else {
+        let BackendConfig::Postgres(net) = &config.database.backend else {
             panic!("wrong backend");
         };
         assert_eq!(net.port, None);
         assert_eq!(net.database.as_deref(), Some("app"));
 
         let table: toml::Table = toml::from_str(
-            "driver = \"postgres\"\nhost = \"h\"\nuser = \"u\"\ntls = true\nport = 5433",
+            "[database]\ndriver = \"postgres\"\nhost = \"h\"\nuser = \"u\"\ntls = true\nport = 5433",
         )
         .unwrap();
         assert!(super::reject_unknown_keys(&table).is_ok());
-        let table: toml::Table =
-            toml::from_str("driver = \"postgres\"\nhost = \"h\"\nuser = \"u\"\npath = \"/a.db\"")
-                .unwrap();
+        let table: toml::Table = toml::from_str(
+            "[database]\ndriver = \"postgres\"\nhost = \"h\"\nuser = \"u\"\npath = \"/a.db\"",
+        )
+        .unwrap();
         let err = super::reject_unknown_keys(&table).unwrap_err().to_string();
         assert!(err.contains("\"path\""), "{err}");
     }
@@ -487,17 +624,27 @@ mod tests {
 
     #[test]
     fn backend_keys_do_not_leak_across_drivers() {
-        let table: toml::Table =
-            toml::from_str("driver = \"sqlite\"\npath = \"/a.db\"\nhost = \"127.0.0.1\"").unwrap();
+        let table: toml::Table = toml::from_str(
+            "[database]\ndriver = \"sqlite\"\npath = \"/a.db\"\nhost = \"127.0.0.1\"",
+        )
+        .unwrap();
         let err = super::reject_unknown_keys(&table).unwrap_err().to_string();
         assert!(err.contains("\"host\""), "{err}");
 
         let table: toml::Table =
-            toml::from_str("driver = \"mysql\"\nhost = \"h\"\nuser = \"u\"\npath = \"/a.db\"")
+            toml::from_str("[database]\ndriver = \"sqlite\"\npath = \"/a.db\"\ndatabase = \"app\"")
                 .unwrap();
+        let err = super::reject_unknown_keys(&table).unwrap_err().to_string();
+        assert!(err.contains("unknown database key \"database\""), "{err}");
+
+        let table: toml::Table = toml::from_str(
+            "[database]\ndriver = \"mysql\"\nhost = \"h\"\nuser = \"u\"\npath = \"/a.db\"",
+        )
+        .unwrap();
         assert!(super::reject_unknown_keys(&table).is_err());
 
-        let table: toml::Table = toml::from_str("driver = \"sqlite\"\npth = \"/a.db\"").unwrap();
+        let table: toml::Table =
+            toml::from_str("[database]\ndriver = \"sqlite\"\npth = \"/a.db\"").unwrap();
         let err = super::reject_unknown_keys(&table).unwrap_err().to_string();
         assert!(err.contains("did you mean \"path\""), "{err}");
     }
@@ -505,59 +652,98 @@ mod tests {
     #[test]
     fn http_config_validation() {
         let cfg = |extra: &str| -> Config {
-            toml::from_str(&format!("driver = \"sqlite\"\npath = \"/a.db\"\n{extra}")).unwrap()
+            toml::from_str(&format!(
+                "[database]\ndriver = \"sqlite\"\npath = \"/a.db\"\n{extra}"
+            ))
+            .unwrap()
         };
         let token = "0123456789abcdef0123456789abcdef";
 
         assert!(cfg("").http().unwrap().is_none());
 
         let http = cfg(&format!(
-            "http_listen = \"127.0.0.1:8650\"\nhttp_token = \"{token}\""
+            "[http]\nlisten = \"127.0.0.1:8650\"\ntoken = \"{token}\"\n\
+             max_sessions = 3\nsession_idle_timeout = 0\neviction_grace = 300"
         ))
         .http()
         .unwrap()
         .unwrap();
         assert_eq!(http.listen.port(), 8650);
         assert_eq!(http.tokens.len(), 1);
+        assert_eq!(http.max_sessions, 3);
+        assert!(http.session_idle_timeout.is_none());
+        assert_eq!(http.eviction_grace.unwrap().as_secs(), 300);
+
         let http = cfg(&format!(
-            "http_listen = \"127.0.0.1:0\"\nhttp_tokens = [\"{token}\", \"{token}2\"]"
+            "[http]\nlisten = \"127.0.0.1:8650\"\ntoken = \"{token}\"\n\
+             session_idle_timeout = 60\neviction_grace = 0"
+        ))
+        .http()
+        .unwrap()
+        .unwrap();
+        assert_eq!(http.session_idle_timeout.unwrap().as_secs(), 60);
+        assert!(http.eviction_grace.is_none());
+
+        let err = cfg(&format!(
+            "[http]\nlisten = \"127.0.0.1:8650\"\ntoken = \"{token}\"\n\
+             session_idle_timeout = 0\neviction_grace = 0"
+        ))
+        .http()
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("cannot both be 0"), "{err}");
+
+        let http = cfg(&format!(
+            "[http]\nlisten = \"127.0.0.1:0\"\ntokens = [\"{token}\", \"{token}2\"]"
         ))
         .http()
         .unwrap()
         .unwrap();
         assert_eq!(http.tokens.len(), 2);
 
-        let err = cfg("http_listen = \"127.0.0.1:8650\"")
+        let err = cfg("[http]\nlisten = \"127.0.0.1:8650\"")
             .http()
             .unwrap_err()
             .to_string();
         assert!(err.contains("openssl rand"), "{err}");
 
-        assert!(cfg(&format!("http_token = \"{token}\"")).http().is_err());
+        assert!(
+            toml::from_str::<Config>(&format!(
+                "[database]\ndriver = \"sqlite\"\npath = \"/a.db\"\n[http]\ntoken = \"{token}\""
+            ))
+            .is_err()
+        );
 
         assert!(
             cfg(&format!(
-                "http_listen = \"127.0.0.1:1\"\nhttp_token = \"{token}\"\nhttp_tokens = [\"{token}\"]"
+                "[http]\nlisten = \"127.0.0.1:1\"\ntoken = \"{token}\"\ntokens = [\"{token}\"]"
             ))
             .http()
             .is_err()
         );
 
         assert!(
-            cfg("http_listen = \"127.0.0.1:1\"\nhttp_token = \"short\"")
+            cfg("[http]\nlisten = \"127.0.0.1:1\"\ntoken = \"short\"")
                 .http()
                 .is_err()
         );
         assert!(
             cfg(&format!(
-                "http_listen = \"127.0.0.1:1\"\nhttp_tokens = [\"{token}\", \"{token}\"]"
+                "[http]\nlisten = \"127.0.0.1:1\"\ntokens = [\"{token}\", \"{token}\"]"
             ))
             .http()
             .is_err()
         );
         assert!(
             cfg(&format!(
-                "http_listen = \"localhost:8650\"\nhttp_token = \"{token}\""
+                "[http]\nlisten = \"localhost:8650\"\ntoken = \"{token}\""
+            ))
+            .http()
+            .is_err()
+        );
+        assert!(
+            cfg(&format!(
+                "[http]\nlisten = \"127.0.0.1:1\"\ntoken = \"{token}\"\nmax_sessions = 0"
             ))
             .http()
             .is_err()
@@ -566,24 +752,91 @@ mod tests {
 
     #[test]
     fn unknown_keys_are_rejected_with_suggestion() {
-        let table: toml::Table =
-            toml::from_str("driver = \"mysql\"\nhost = \"h\"\nuser = \"u\"\nread_onyl = true")
-                .unwrap();
+        let table: toml::Table = toml::from_str(
+            "[database]\ndriver = \"mysql\"\nhost = \"h\"\nuser = \"u\"\nread_onyl = true",
+        )
+        .unwrap();
         let err = super::reject_unknown_keys(&table).unwrap_err().to_string();
         assert!(err.contains("read_onyl"), "{err}");
         assert!(err.contains("did you mean \"read_only\""), "{err}");
 
-        let table: toml::Table =
-            toml::from_str("driver = \"mysql\"\nhost = \"h\"\nuser = \"u\"\ntls_insecue = true")
-                .unwrap();
+        let table: toml::Table = toml::from_str(
+            "[database]\ndriver = \"mysql\"\nhost = \"h\"\nuser = \"u\"\ntls_insecue = true",
+        )
+        .unwrap();
         let err = super::reject_unknown_keys(&table).unwrap_err().to_string();
         assert!(err.contains("did you mean \"tls_insecure\""), "{err}");
+
+        let flat: toml::Table = toml::from_str("driver = \"sqlite\"\npath = \":memory:\"").unwrap();
+        let err = super::reject_unknown_keys(&flat).unwrap_err().to_string();
+        assert!(err.contains("`driver` belongs under [database]"), "{err}");
+    }
+
+    #[test]
+    fn misplaced_keys_report_destination() {
+        let err = |input: &str| -> String {
+            let table: toml::Table = toml::from_str(input).unwrap();
+            super::reject_unknown_keys(&table).unwrap_err().to_string()
+        };
+
+        let message = err("host = \"h\"");
+        assert!(
+            message.contains("`host` belongs under [database]"),
+            "{message}"
+        );
+
+        let message = err(r#"
+            [database]
+            driver = "sqlite"
+            path = ":memory:"
+            token = "0123456789abcdef0123456789abcdef"
+            "#);
+        assert!(
+            message.contains("`token` belongs under [http]"),
+            "{message}"
+        );
+
+        let message = err(r#"
+            [database]
+            driver = "sqlite"
+            path = ":memory:"
+
+            [http]
+            listen = "127.0.0.1:8650"
+            host = "h"
+            "#);
+        assert!(
+            message.contains("`host` belongs under [database]"),
+            "{message}"
+        );
+
+        let message = err("database = \"app\"");
+        assert!(
+            message.contains("top-level `database` must be a [database] table"),
+            "{message}"
+        );
+
+        let message = err(r#"
+            [database]
+            driver = "postgres"
+            host = "h"
+            user = "u"
+
+            [http]
+            listen = "127.0.0.1:8650"
+            token = "0123456789abcdef0123456789abcdef"
+            database = "app"
+            "#);
+        assert!(
+            message.contains("`database` belongs under [database]"),
+            "{message}"
+        );
     }
 
     #[test]
     fn known_keys_pass_and_missing_driver_fails() {
         let table: toml::Table = toml::from_str(
-            "driver = \"mariadb\"\nhost = \"h\"\nuser = \"u\"\nmax_response_bytes = 1024\ntls = true",
+            "[database]\ndriver = \"mariadb\"\nhost = \"h\"\nuser = \"u\"\nmax_response_bytes = 1024\ntls = true",
         )
         .unwrap();
         assert!(super::reject_unknown_keys(&table).is_ok());
@@ -595,7 +848,8 @@ mod tests {
     #[test]
     fn unknown_driver_is_rejected() {
         assert!(
-            toml::from_str::<Config>("driver = \"oracle\"\nhost = \"h\"\nuser = \"u\"").is_err()
+            toml::from_str::<Config>("[database]\ndriver = \"oracle\"\nhost = \"h\"\nuser = \"u\"")
+                .is_err()
         );
     }
 

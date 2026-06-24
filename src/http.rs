@@ -15,14 +15,16 @@ use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
 use subtle::ConstantTimeEq;
 use tower_service::Service;
 
-use crate::SqlServer;
+use crate::SqlServerFactory;
 use crate::config::HttpConfig;
 
-pub async fn serve(server: SqlServer, http: HttpConfig) -> Result<()> {
+pub async fn serve(servers: SqlServerFactory, http: HttpConfig) -> Result<()> {
     let tokens: Arc<Vec<String>> = Arc::new(http.tokens);
+    let mut sessions = LocalSessionManager::default();
+    sessions.session_config.keep_alive = http.session_idle_timeout;
     let service = StreamableHttpService::new(
-        move || Ok(server.clone()),
-        Arc::new(LocalSessionManager::default()),
+        move || Ok(servers.new_session()),
+        Arc::new(sessions),
         StreamableHttpServerConfig::default().disable_allowed_hosts(),
     );
 
@@ -32,9 +34,17 @@ pub async fn serve(server: SqlServer, http: HttpConfig) -> Result<()> {
 
     let local = listener.local_addr().context("resolve bound address")?;
     eprintln!(
-        "[sql-mcp] http listening on http://{local} (bearer auth, {} token{}).",
+        "[sql-mcp] http listening on http://{local} (bearer auth, {} token{}; {} database \
+         sessions; {} MCP idle timeout; {} eviction grace).",
         tokens.len(),
-        if tokens.len() == 1 { "" } else { "s" }
+        if tokens.len() == 1 { "" } else { "s" },
+        http.max_sessions,
+        http.session_idle_timeout
+            .map(|duration| format!("{}s", duration.as_secs()))
+            .unwrap_or_else(|| "unlimited".to_string()),
+        http.eviction_grace
+            .map(|duration| format!("{}s", duration.as_secs()))
+            .unwrap_or_else(|| "disabled".to_string()),
     );
 
     loop {
